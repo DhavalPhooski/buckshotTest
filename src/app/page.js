@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 const supabaseUrl = 'https://mfqqzvplykhvhfnqriaw.supabase.co'; // e.g., 'https://abcde12345.supabase.co'
 const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1mcXF6dnBseWtodmhmbnFyaWF3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTI3NDEyMDAsImV4cCI6MjA2ODMxNzIwMH0.Mc-ubsnLZ-7HthLNOo51NRPLYLvBZu2m892tFdF0Zz8'; // e.g., 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
 
+
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const SupabaseContext = createContext(null);
@@ -25,6 +26,7 @@ const SupabaseProvider = ({ children }) => {
         const { data, error } = await supabase.auth.signInAnonymously();
         if (error) throw error;
         setUser(data.user);
+        console.log('Signed in anonymously as:', data.user.id);
       } catch (error) {
         console.error('Error signing in anonymously:', error.message);
       } finally {
@@ -38,6 +40,7 @@ const SupabaseProvider = ({ children }) => {
     const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user || null);
       setLoading(false);
+      console.log('Auth state changed. Current user:', session?.user?.id || 'none');
     });
 
     return () => {
@@ -144,7 +147,7 @@ const RoomPage = ({ roomId, onLeaveRoom }) => {
         .update({ game_state: newGameState })
         .eq('id', room.id);
       if (error) throw error;
-      // console.log('Game state updated:', data);
+      console.log('Game state updated successfully.');
     } catch (error) {
       console.error('Error updating game state:', error.message);
       setMessage(`Error: ${error.message}`);
@@ -153,11 +156,17 @@ const RoomPage = ({ roomId, onLeaveRoom }) => {
 
   // Initialize game
   const initializeGame = useCallback(async () => {
-    if (!isHost || !room || room.status !== 'playing' || room.game_state?.game_started) return;
+    console.log('Attempting to initialize game...');
+    console.log('isHost:', isHost, 'room:', room, 'room.status:', room?.status, 'game_started:', room?.game_state?.game_started);
 
+    if (!isHost || !room || room.status !== 'playing' || room.game_state?.game_started) {
+      console.log('Initialization conditions not met.');
+      return;
+    }
+
+    console.log('Initializing game now!');
     const { bullets, realBullets, fakeBullets } = generateBullets();
     const firstTurnPlayerId = Math.random() < 0.5 ? room.player1_id : room.player2_id;
-    const firstTurnMessage = `Coin flip: ${firstTurnPlayerId === room.player1_id ? 'Player 1' : 'Player 2'} goes first!`;
 
     const initialGameState = {
       player1_lives: INITIAL_LIVES,
@@ -167,13 +176,19 @@ const RoomPage = ({ roomId, onLeaveRoom }) => {
       current_turn: firstTurnPlayerId,
       game_started: true,
       winner: null,
-      message: firstTurnMessage,
-      player1_id: room.player1_id,
-      player2_id: room.player2_id,
+      // Use last_action for initial coin flip message
+      last_action: {
+        shooterId: null, // No shooter for coin flip
+        targetId: null, // No target for coin flip
+        bulletType: null, // No bullet for coin flip
+        outcome: 'coin_flip',
+        firstTurnPlayerId: firstTurnPlayerId, // Store who got first turn
+        timestamp: Date.now()
+      },
     };
 
     await updateGameState(initialGameState);
-    setMessage(firstTurnMessage);
+    // Message will be set by the useEffect watching last_action
     setShowBulletInfo(true); // Show bullet info initially
     setTimeout(() => setShowBulletInfo(false), 5000); // Hide after 5 seconds
   }, [isHost, room, updateGameState]);
@@ -192,73 +207,153 @@ const RoomPage = ({ roomId, onLeaveRoom }) => {
     const currentGameState = { ...room.game_state };
     const shotBullet = currentGameState.bullets.shift(); // Take one bullet
 
-    let actionMessage = '';
-    let nextTurn = currentGameState.current_turn;
+    let outcome = '';
+    let nextTurn = currentGameState.current_turn; // Default to current turn (for fake self-shot)
     let reloadNeeded = false;
+    let lastShooter = myId;
+    let lastTarget = target === 'self' ? myId : otherPlayerId;
 
     if (target === 'self') {
       if (shotBullet === 'fake') {
-        actionMessage = `You shot yourself with a FAKE bullet! You get another turn.`;
-        // Turn remains the same
+        outcome = 'fake_self_hit';
+        // nextTurn remains myId
       } else { // real bullet
         currentGameState[myId === currentGameState.player1_id ? 'player1_lives' : 'player2_lives']--;
-        actionMessage = `You shot yourself with a REAL bullet! Your health is now ${currentGameState[myId === currentGameState.player1_id ? 'player1_lives' : 'player2_lives']}. ${otherPlayerId ? 'Opponent\'s turn.' : ''}`;
+        outcome = 'real_self_hit';
         nextTurn = otherPlayerId;
       }
     } else { // target === 'opponent'
       if (shotBullet === 'fake') {
-        actionMessage = `You shot your opponent with a FAKE bullet! ${otherPlayerId ? 'Opponent\'s turn.' : ''}`;
+        outcome = 'fake_opponent_hit';
         nextTurn = otherPlayerId;
       } else { // real bullet
         currentGameState[otherPlayerId === currentGameState.player1_id ? 'player1_lives' : 'player2_lives']--;
-        actionMessage = `You shot your opponent with a REAL bullet! Their health is now ${currentGameState[otherPlayerId === currentGameState.player1_id ? 'player1_lives' : 'player2_lives']}. ${otherPlayerId ? 'Opponent\'s turn.' : ''}`;
+        outcome = 'real_opponent_hit';
         nextTurn = otherPlayerId;
       }
     }
 
     // Check for game end
+    let winner = null;
     if (currentGameState.player1_lives <= 0) {
-      currentGameState.winner = currentGameState.player2_id;
-      actionMessage += ` Player 2 (${currentGameState.player2_id}) wins!`;
+      winner = currentGameState.player2_id;
+      outcome += '_game_end'; // Append game end status
       nextTurn = null; // Game over
     } else if (currentGameState.player2_lives <= 0) {
-      currentGameState.winner = currentGameState.player1_id;
-      actionMessage += ` Player 1 (${currentGameState.player1_id}) wins!`;
+      winner = currentGameState.player1_id;
+      outcome += '_game_end'; // Append game end status
       nextTurn = null; // Game over
-    } else if (currentGameState.bullets.length === 0) {
-      // If bullets run out, reload
+    } else if (currentGameState.bullets.length === 0 && !winner) { // Reload only if game is not over
       reloadNeeded = true;
-      actionMessage += ` Bullets ran out! Reloading...`;
+      outcome += '_reload_needed'; // Append reload status
     }
 
     currentGameState.current_turn = nextTurn;
-    currentGameState.message = actionMessage;
+    currentGameState.winner = winner;
+    currentGameState.last_action = {
+      shooterId: lastShooter,
+      targetId: lastTarget,
+      bulletType: shotBullet,
+      outcome: outcome,
+      timestamp: Date.now() // To ensure updates even if other fields are same
+    };
+    // The 'message' field is now derived on the client side, so no need to set it here
+    // delete currentGameState.message; // Clear old message if it existed
 
     await updateGameState(currentGameState);
 
-    if (reloadNeeded) {
+    if (reloadNeeded && !winner) { // Reload only if game is not over
       setTimeout(async () => {
         const { bullets: newBullets, realBullets, fakeBullets } = generateBullets();
         const reloadedGameState = {
           ...currentGameState,
           bullets: newBullets,
           displayed_bullets: { real: realBullets, fake: fakeBullets },
-          message: `Bullets reloaded! Real: ${realBullets}, Fake: ${fakeBullets}.`,
+          last_action: {
+            shooterId: null, // No specific shooter for reload
+            targetId: null,
+            bulletType: null,
+            outcome: 'reloaded',
+            timestamp: Date.now()
+          }
         };
         await updateGameState(reloadedGameState);
-        setMessage(`Bullets reloaded! Real: ${realBullets}, Fake: ${fakeBullets}.`);
-        setShowBulletInfo(true);
-        setTimeout(() => setShowBulletInfo(false), 5000);
-      }, 1000); // Small delay for reload message
+        // setMessage will be handled by the useEffect watching last_action
+      }, 1000);
     }
 
   }, [room, myId, otherPlayerId, updateGameState]);
 
+  // Effect to handle dynamic message display based on last_action
+  useEffect(() => {
+    if (!room?.game_state?.last_action) return;
+
+    const { shooterId, targetId, bulletType, outcome, firstTurnPlayerId } = room.game_state.last_action;
+    let displayMessage = '';
+
+    const isMyShot = shooterId === myId;
+    const isMyTarget = targetId === myId;
+    const isOpponentShot = shooterId === otherPlayerId;
+    const isOpponentTarget = targetId === otherPlayerId;
+
+    if (outcome === 'coin_flip') {
+      displayMessage = `Coin flip: ${firstTurnPlayerId === myId ? 'You' : 'Opponent'} goes first!`;
+    } else if (outcome === 'reloaded') {
+      displayMessage = `Bullets reloaded! Real: ${room.game_state.displayed_bullets.real}, Fake: ${room.game_state.displayed_bullets.fake}.`;
+      setShowBulletInfo(true);
+      setTimeout(() => setShowBulletInfo(false), 5000);
+    } else if (outcome.includes('game_end')) {
+      const winnerId = room.game_state.winner;
+      if (winnerId === myId) {
+        displayMessage = `Game Over! You Win!`;
+      } else if (winnerId === otherPlayerId) {
+        displayMessage = `Game Over! You Lose!`;
+      } else {
+        displayMessage = `Game Over!`; // Should not happen if winner is always set
+      }
+    } else {
+      // Handle shooting messages
+      if (isMyShot) {
+        if (isMyTarget) { // Shot self
+          if (bulletType === 'fake') {
+            displayMessage = `You shot yourself with a FAKE bullet! You get another turn.`;
+          } else { // real
+            displayMessage = `You shot yourself with a REAL bullet! Your health is now ${myLives}. ${otherPlayerId ? 'Opponent\'s turn.' : ''}`;
+          }
+        } else { // Shot opponent
+          if (bulletType === 'fake') {
+            displayMessage = `You shot your opponent with a FAKE bullet! ${otherPlayerId ? 'Opponent\'s turn.' : ''}`;
+          } else { // real
+            displayMessage = `You shot your opponent with a REAL bullet! Their health is now ${oppLives}. ${otherPlayerId ? 'Opponent\'s turn.' : ''}`;
+          }
+        }
+      } else if (isOpponentShot) { // Opponent shot
+        if (isMyTarget) { // Opponent shot me
+          if (bulletType === 'fake') {
+            displayMessage = `Your opponent shot you with a FAKE bullet! It's your turn.`;
+          } else { // real
+            displayMessage = `Your opponent shot you with a REAL bullet! Your health is now ${myLives}. It's your turn.`;
+          }
+        } else { // Opponent shot self
+          if (bulletType === 'fake') {
+            displayMessage = `Your opponent shot themselves with a FAKE bullet! It's their turn again.`;
+          } else { // real
+            displayMessage = `Your opponent shot themselves with a REAL bullet! Their health is now ${oppLives}. It's your turn.`;
+          }
+        }
+      }
+    }
+    setMessage(displayMessage);
+  }, [room?.game_state?.last_action, myId, otherPlayerId, myLives, oppLives, room?.game_state?.displayed_bullets, room?.game_state?.winner]);
+
+
   // Fetch room data and set up real-time subscription
   useEffect(() => {
-    if (loading || !supabase || !roomId) return;
+    console.log('RoomPage useEffect: roomId changed or loading/supabase changed. Current myId:', myId);
+    if (loading || !supabase || !roomId || !myId) return; // Ensure myId is available
 
     const fetchRoom = async () => {
+      console.log('Fetching room:', roomId);
       try {
         const { data, error } = await supabase
           .from('rooms')
@@ -268,9 +363,11 @@ const RoomPage = ({ roomId, onLeaveRoom }) => {
 
         if (error) throw error;
         setRoom(data);
+        console.log('Fetched room data:', data);
 
         // If room found and not full, and current user is not already a player, join the room
         if (data && data.status === 'waiting' && !data.player2_id && data.player1_id !== myId) {
+          console.log('Attempting to join room as Player 2...');
           const { data: updatedRoom, error: updateError } = await supabase
             .from('rooms')
             .update({ player2_id: myId, status: 'playing' })
@@ -281,11 +378,14 @@ const RoomPage = ({ roomId, onLeaveRoom }) => {
           if (updateError) throw updateError;
           setRoom(updatedRoom);
           setMessage(`Joined room ${roomId}. Waiting for host to start.`);
+          console.log('Successfully joined room as Player 2:', updatedRoom);
         } else if (data && data.status === 'playing' && data.player1_id !== myId && data.player2_id !== myId) {
           setMessage('Room is full. Cannot join.');
+          console.log('Room is full, leaving.');
           onLeaveRoom(); // Redirect back to home if room is full
         } else if (data && data.status === 'finished') {
           setMessage('Game has already finished in this room.');
+          console.log('Game finished, leaving.');
         }
 
       } catch (error) {
@@ -301,32 +401,41 @@ const RoomPage = ({ roomId, onLeaveRoom }) => {
     const channel = supabase
       .channel(`room:${roomId}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, payload => {
-        // console.log('Change received!', payload);
+        console.log('Real-time change received!', payload);
         if (payload.new) {
           setRoom(payload.new);
-          if (payload.new.game_state?.message) {
-            setMessage(payload.new.game_state.message);
-          }
-          if (payload.new.game_state?.displayed_bullets && payload.old?.game_state?.bullets.length === 0 && payload.new.game_state.bullets.length > 0) {
-            // Only show bullet info on reload
-            setShowBulletInfo(true);
-            setTimeout(() => setShowBulletInfo(false), 5000);
-          }
+          // Message will now be handled by the new useEffect watching last_action
+          // if (payload.new.game_state?.message) {
+          //   setMessage(payload.new.game_state.message);
+          // }
+          // if (payload.new.game_state?.displayed_bullets && payload.old?.game_state?.bullets.length === 0 && payload.new.game_state.bullets.length > 0) {
+          //   // Only show bullet info on reload
+          //   setShowBulletInfo(true);
+          //   setTimeout(() => setShowBulletInfo(false), 5000);
+          // }
         }
       })
       .subscribe();
 
     return () => {
+      console.log('Unsubscribing from channel:', roomId);
       channel.unsubscribe();
     };
   }, [supabase, roomId, myId, loading, onLeaveRoom]);
 
   useEffect(() => {
+    console.log('Initialize Game useEffect triggered. Current room state:', room);
     // Automatically start game when two players are in and status is playing
     if (room && room.status === 'playing' && room.player1_id && room.player2_id && !room.game_state?.game_started) {
+      console.log('Conditions met for game initialization.');
       if (isHost) { // Only host initializes the game
+        console.log('Host is initializing the game.');
         initializeGame();
+      } else {
+        console.log('Not host, waiting for host to initialize.');
       }
+    } else {
+      console.log('Conditions not met for game initialization. Room Status:', room?.status, 'Player1 ID:', room?.player1_id, 'Player2 ID:', room?.player2_id, 'Game Started:', room?.game_state?.game_started);
     }
   }, [room, isHost, initializeGame]);
 
@@ -356,13 +465,18 @@ const RoomPage = ({ roomId, onLeaveRoom }) => {
           <p className="text-xl text-yellow-400 mt-4">Waiting for another player to join...</p>
         )}
 
+        {/* Health Bars - Always visible */}
+        <div className="mt-6 p-4 bg-gray-700 rounded-lg">
+          <h2 className="text-2xl font-semibold mb-4 text-orange-400">Lives</h2>
+          <div className="flex justify-around mb-4 text-xl">
+            <p>Your Lives: <span className="font-bold text-red-500">{myLives !== undefined ? myLives : '?'}</span></p>
+            {otherPlayerId && <p>Opponent Lives: <span className="font-bold text-red-500">{oppLives !== undefined ? oppLives : '?'}</span></p>}
+          </div>
+        </div>
+
         {room.status === 'playing' && room.game_state && (
           <div className="mt-6 p-4 bg-gray-700 rounded-lg">
             <h2 className="text-2xl font-semibold mb-4 text-orange-400">Game State</h2>
-            <div className="flex justify-around mb-4 text-xl">
-              <p>Your Lives: <span className="font-bold text-red-500">{myLives}</span></p>
-              {otherPlayerId && <p>Opponent Lives: <span className="font-bold text-red-500">{oppLives}</span></p>}
-            </div>
 
             {showBulletInfo && room.game_state.displayed_bullets && (
               <p className="text-xl mb-4 text-yellow-300">
@@ -440,6 +554,7 @@ const MainGameLogic = () => {
       if (error) throw error;
       setCurrentRoomId(data.id); // Use the actual UUID generated by Supabase
       setCurrentPage('room');
+      console.log('Hosted new room with ID:', data.id);
     } catch (error) {
       console.error('Error hosting game:', error.message);
       alert(`Error hosting game: ${error.message}`);
@@ -454,12 +569,14 @@ const MainGameLogic = () => {
     }
     setCurrentRoomId(roomId);
     setCurrentPage('room');
+    console.log('Attempting to join room with ID:', roomId);
   };
 
   // Function to leave the room and go back to home
   const handleLeaveRoom = () => {
     setCurrentRoomId(null);
     setCurrentPage('home');
+    console.log('Left room.');
   };
 
   // Render content based on current page
@@ -499,6 +616,11 @@ const App = () => {
 
   return (
     <SupabaseProvider>
+      {/* To test multiplayer:
+        1. Open the first instance in a regular browser tab.
+        2. Open the second instance in an Incognito/Private window (or a different browser).
+        This ensures two distinct anonymous users are created for Supabase authentication.
+      */}
       <MainGameLogic /> {/* Main game logic is now a child of SupabaseProvider */}
     </SupabaseProvider>
   );
